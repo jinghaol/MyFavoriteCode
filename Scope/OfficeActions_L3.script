@@ -1,0 +1,962 @@
+﻿/* *********************************************************************************************** */
+/* Script GUID:3052b224-d22e-4857-948a-02589d39085e                                                */
+/* This script generates aggregation data for Office 365 user and tenant engagement.  It's also    */
+/* called DAUMAU L3 data.  The script is deployed in SDP as a Cosmos activity and triggered by     */
+/* cooresponding L2 script event                                                                   */
+REFERENCE @"/shares/0365exp.adhoc/O365EXP/resources/bin/System.Web.dll";
+REFERENCE @"/shares/0365exp.adhoc/AppData/Resources/Binaries/Microsoft.O365Tools.Cosmos.UsageLibrary.dll";
+USING UsageLibrary; 
+
+/* Input */
+#DECLARE ProcessingDate string = "@@date@@";
+//#DECLARE O365DataPipelinePath string = @"/users/jinghaol/DAUL2";
+#DECLARE O365DataPipelinePath string = @"/shares/0365exp.adhoc/O365DataPipeline";
+#DECLARE FirstMonthDate string = new DateTime(DateTime.Parse(@ProcessingDate).Year, DateTime.Parse(@ProcessingDate).Month, 1).ToString("yyyy-MM-dd");
+#DECLARE Minus28DayDate string = DateTime.Parse(@ProcessingDate).AddDays(-27).ToString("yyyy-MM-dd"); // ?? change here to include different number of files
+#DECLARE Last28DayPath string = string.Format(@"{0}/DAUMAU/L2/Prod/%Y/%m/%Y-%m-%d-User-Actions.ss?date={1}...{2}", 
+                                              @O365DataPipelinePath, @Minus28DayDate, @ProcessingDate);
+#DECLARE UrlFeatureMappingPath string = "/users/jinghaol/data/PortalAppUrl_Feature.csv";
+#DECLARE OfficeTenantViewPath string = @"/shares/bus.prod/local/office/Odin/Tenant/OfficeDataTenant.view";
+#DECLARE OfficeUserViewPath string = @"/shares/bus.prod/local/office/Resources/Views/Public/OBD_User_UserInfo.view";
+
+/* Output */
+#DECLARE FinalFilePath string = string.Format(@"{0}/DAUMAU/L3/Prod/DAUMAU_L3_V6.ss", @O365DataPipelinePath);
+
+// Read the data from input files
+Last28Day = SSTREAM @Last28DayPath;
+UrlFeatures = 
+    EXTRACT 
+        Url:string,
+        Feature:string
+    FROM @UrlFeatureMappingPath
+    USING DefaultTextExtractor("-d", ",")
+;
+
+// Process Shell action data by 
+// 1) Convert TimeStamp column to Date column
+// 2) GetAppName with Url 
+// 3) Mapping Url/AppName to Feature
+Last28DayShell = 
+    SELECT 
+        DateTime.Parse(TimeStamp).ToString("yyyy-MM-dd") AS Date,
+        //UserId,
+        PUID,
+        TenantId,
+        Workload,
+        string.IsNullOrEmpty(App)? "":UsageHelper.GetAppName(App, Workload) AS App
+    FROM Last28Day 
+    WHERE DataSource=="Shell" 
+      AND (NOT string.IsNullOrEmpty(PUID) AND PUID.Length==16)
+;
+Last28DayShell = 
+    SELECT 
+        Date,
+        //UserId,
+        PUID,
+        TenantId,
+        Workload,
+        u.Feature==null? App:u.Feature AS App
+    FROM Last28DayShell AS l LEFT OUTER JOIN UrlFeatures AS u ON l.App==u.Url
+;
+// Union processed Shell data with other data sources
+Last28Day = 
+    SELECT 
+        DateTime.Parse(TimeStamp).ToString("yyyy-MM-dd") AS Date,
+        //UserId,
+        PUID,
+        TenantId,
+        Workload,
+        App
+    FROM Last28Day
+    WHERE NOT string.IsNullOrEmpty(PUID)
+      AND NOT string.IsNullOrEmpty(TimeStamp)
+      AND (DataSource=="OAV" OR DataSource=="Client")
+    UNION ALL
+    SELECT 
+        *
+    FROM Last28DayShell
+;
+// Aggregate necessary columns to reduce the size of 28 days data
+Last28Day = 
+    SELECT 
+        Date,
+        //UserId,
+        PUID,
+        TenantId,
+        Workload,
+        App,
+        COUNT(*) AS Count
+    FROM Last28Day
+    WHERE DateTime.Parse(Date) >= DateTime.Parse(@Minus28DayDate)
+      AND DateTime.Parse(Date) <= DateTime.Parse(@ProcessingDate)
+;
+
+// Build tenant pivot information for segmentation 
+Tenants =
+    VIEW @OfficeTenantViewPath
+    PARAMS
+    (
+        StartSnapshotTime = DateTime.Parse(@ProcessingDate).AddDays(0).ToString("yyyy-MM-dd"),
+        EndSnapshotTime = DateTime.Parse(@ProcessingDate).AddDays(0).ToString("yyyy-MM-dd")
+    );
+TenantInfo =
+    SELECT
+        Id AS TenantId,
+        HasEducation,
+        HasPaid,
+        UserStatisticsInfo.LicensedUsers,
+        IsViral
+    FROM Tenants
+;
+// Build user pivot information for segmentation 
+UserInfo = 
+    SELECT 
+        UserObjectId,
+        OrgIdPUIDHex,
+        OMSTenantId,
+        HasEDU,
+        HasPaid
+    FROM
+    (
+        VIEW @OfficeUserViewPath
+        PARAMS
+        (
+            startDate=DateTime.Parse(@ProcessingDate), 
+            endDate=DateTime.Parse(@ProcessingDate), 
+            excludeReferenceDlls="DataMining.Office.ScopeExtension.dll"
+        )
+    )
+    WHERE NOT string.IsNullOrEmpty(OrgIdPUIDHex)
+;
+// Join tenant and user info with Last28Day data
+Last28Day = 
+    SELECT 
+        l28.Date,
+        //l28.UserId,
+        l28.PUID,
+        u.OMSTenantId AS TenantId,
+        l28.Workload,
+        l28.App,
+        l28.Count,
+        (t.HasEducation!=null AND t.HasEducation==true? "Edu":(t.HasPaid!=null AND t.HasPaid==false? "Trial":"Paid")) AS EduTrialPaid,
+        (t.LicensedUsers!=null? Helper.ClassifyTenantSize((long)t.LicensedUsers):"unknown") AS Size,
+        (t.IsViral!=null AND t.IsViral==true? "Viral":"Nonviral") AS Viral
+    FROM Last28Day AS l28 LEFT OUTER JOIN UserInfo AS u ON l28.PUID==u.OrgIdPUIDHex
+                          LEFT OUTER JOIN TenantInfo AS t ON u.OMSTenantId==t.TenantId
+;
+
+/**********************************************************************/
+/* Calculate DAU for workload/app/total and union them                */
+/**********************************************************************/
+
+/**************/
+/* Workload   */
+/**************/
+// Calculate Workload daily counts with All Dims
+Last28DayWorkloadDailyAllDims =
+    SELECT
+        Date,
+        Workload AS Value,
+        "Workload" AS Type,
+        EduTrialPaid,
+        Size,
+        Viral,
+        COUNT(DISTINCT PUID) AS DailyCount
+    FROM Last28Day
+;   
+// Aggregate Workload DAU by AVG daliy with All Dims
+Last28DayWorkloadDAUAllDims =
+    SELECT
+        @ProcessingDate AS Date,
+        Value,
+        Type,
+        EduTrialPaid,
+        Size,
+        Viral, 
+        AVG(DailyCount) AS Last28DayDAU
+    FROM Last28DayWorkloadDailyAllDims
+;  
+// Calculate Workload daily counts with Edu Dim
+Last28DayWorkloadDailyEduDim =
+    SELECT
+        Date,
+        Workload AS Value,
+        "Workload" AS Type,
+        EduTrialPaid,
+        "All" AS Size,
+        "All" AS Viral,
+        COUNT(DISTINCT PUID) AS DailyCount
+    FROM Last28Day
+;   
+// Aggregate Workload DAU by AVG daliy with Edu Dim
+Last28DayWorkloadDAUEduDim =
+    SELECT
+        @ProcessingDate AS Date,
+        Value,
+        Type,
+        EduTrialPaid,
+        "All" AS Size,
+        "All" AS Viral,
+        AVG(DailyCount) AS Last28DayDAU
+    FROM Last28DayWorkloadDailyEduDim
+;  
+// Calculate Workload daily counts with Size Dim
+Last28DayWorkloadDailySizeDim =
+    SELECT
+        Date,
+        Workload AS Value,
+        "Workload" AS Type,
+        "All" AS EduTrialPaid,
+        Size,
+        "All" AS Viral,
+        COUNT(DISTINCT PUID) AS DailyCount
+    FROM Last28Day
+;   
+// Aggregate Workload DAU by AVG daliy with Size Dim
+Last28DayWorkloadDAUSizeDim =
+    SELECT
+        @ProcessingDate AS Date,
+        Value,
+        Type,
+        "All" AS EduTrialPaid,
+        Size,
+        "All" AS Viral,
+        AVG(DailyCount) AS Last28DayDAU
+    FROM Last28DayWorkloadDailySizeDim
+;  
+// Calculate Workload daily counts with Viral Dim
+Last28DayWorkloadDailyViralDim =
+    SELECT
+        Date,
+        Workload AS Value,
+        "Workload" AS Type,
+        "All" AS EduTrialPaid,
+        "All" AS Size,
+        Viral,
+        COUNT(DISTINCT PUID) AS DailyCount
+    FROM Last28Day
+;   
+// Aggregate Workload DAU by AVG daliy with Viral Dim
+Last28DayWorkloadDAUViralDim =
+    SELECT
+        @ProcessingDate AS Date,
+        Value,
+        Type,
+        "All" AS EduTrialPaid,
+        "All" AS Size,
+        Viral,
+        AVG(DailyCount) AS Last28DayDAU
+    FROM Last28DayWorkloadDailyViralDim
+;  
+// Calculate Workload daily counts with No Dim
+Last28DayWorkloadDailyNoDim =
+    SELECT
+        Date,
+        Workload AS Value,
+        "Workload" AS Type,
+        "All" AS EduTrialPaid,
+        "All" AS Size,
+        "All" AS Viral,
+        COUNT(DISTINCT PUID) AS DailyCount
+    FROM Last28Day
+;   
+// Aggregate Workload DAU by AVG daliy with No Dim
+Last28DayWorkloadDAUNoDim =
+    SELECT
+        @ProcessingDate AS Date,
+        Value,
+        Type,
+        "All" AS EduTrialPaid,
+        "All" AS Size,
+        "All" AS Viral,
+        AVG(DailyCount) AS Last28DayDAU
+    FROM Last28DayWorkloadDailyNoDim
+;  
+
+/**************/
+/* App        */
+/**************/
+// Calculate App daily counts with All Dims
+Last28DayAppDailyAllDims =
+    SELECT
+        Date,
+        App AS Value,
+        "App" AS Type,
+        EduTrialPaid,
+        Size,
+        Viral,
+        COUNT(DISTINCT PUID) AS DailyCount
+    FROM Last28Day
+    WHERE App!="" AND App!=null
+;   
+// Aggregate App DAU by AVG daily with All Dims
+Last28DayAppDAUAllDims =
+    SELECT
+        @ProcessingDate AS Date,
+        Value,
+        Type,
+        EduTrialPaid,
+        Size,
+        Viral,
+        AVG(DailyCount) AS Last28DayDAU
+    FROM Last28DayAppDailyAllDims
+;  
+// Calculate App daily counts with Edu Dim
+Last28DayAppDailyEduDim =
+    SELECT
+        Date,
+        App AS Value,
+        "App" AS Type,
+        EduTrialPaid,
+        "All" AS Size,
+        "All" AS Viral,
+        COUNT(DISTINCT PUID) AS DailyCount
+    FROM Last28Day
+    WHERE App!="" AND App!=null
+;   
+// Aggregate App DAU by AVG daily with Edu Dims
+Last28DayAppDAUEduDim =
+    SELECT
+        @ProcessingDate AS Date,
+        Value,
+        Type,
+        EduTrialPaid,
+        "All" AS Size,
+        "All" AS Viral,
+        AVG(DailyCount) AS Last28DayDAU
+    FROM Last28DayAppDailyEduDim
+;  
+// Calculate App daily counts with Size Dim
+Last28DayAppDailySizeDim =
+    SELECT
+        Date,
+        App AS Value,
+        "App" AS Type,
+        "All" AS EduTrialPaid,
+        Size,
+        "All" AS Viral,
+        COUNT(DISTINCT PUID) AS DailyCount
+    FROM Last28Day
+    WHERE App!="" AND App!=null
+;   
+// Aggregate App DAU by AVG daily with Size Dims
+Last28DayAppDAUSizeDim =
+    SELECT
+        @ProcessingDate AS Date,
+        Value,
+        Type,
+        "All" AS EduTrialPaid,
+        Size,
+        "All" AS Viral,
+        AVG(DailyCount) AS Last28DayDAU
+    FROM Last28DayAppDailySizeDim
+;  
+// Calculate App daily counts with Viral Dim
+Last28DayAppDailyViralDim =
+    SELECT
+        Date,
+        App AS Value,
+        "App" AS Type,
+        "All" AS EduTrialPaid,
+        "All" AS Size,
+        Viral,
+        COUNT(DISTINCT PUID) AS DailyCount
+    FROM Last28Day
+    WHERE App!="" AND App!=null
+;   
+// Aggregate App DAU by AVG daily with Viral Dims
+Last28DayAppDAUViralDim =
+    SELECT
+        @ProcessingDate AS Date,
+        Value,
+        Type,
+        "All" AS EduTrialPaid,
+        "All" AS Size,
+        Viral,
+        AVG(DailyCount) AS Last28DayDAU
+    FROM Last28DayAppDailyViralDim
+;  
+// Calculate App daily counts with No Dim
+Last28DayAppDailyNoDim =
+    SELECT
+        Date,
+        App AS Value,
+        "App" AS Type,
+        "All" AS EduTrialPaid,
+        "All" AS Size,
+        "All" AS Viral,
+        COUNT(DISTINCT PUID) AS DailyCount
+    FROM Last28Day
+    WHERE App!="" AND App!=null
+;   
+// Aggregate App DAU by AVG daily with No Dims
+Last28DayAppDAUNoDim =
+    SELECT
+        @ProcessingDate AS Date,
+        Value,
+        Type,
+        "All" AS EduTrialPaid,
+        "All" AS Size,
+        "All" AS Viral,
+        AVG(DailyCount) AS Last28DayDAU
+    FROM Last28DayAppDailyNoDim
+;  
+
+/**************/
+/* Total      */
+/**************/
+// Calculate Total daily counts with All Dims
+Last28DayTotalDailyAllDims =
+    SELECT
+        Date,
+        "Total" AS Value,
+        "Total" AS Type,
+        EduTrialPaid,
+        Size,
+        Viral,
+        COUNT(DISTINCT PUID) AS DailyCount
+    FROM Last28Day
+;   
+// Aggregate Total DAU by AVG daily counts with all Dims
+Last28DayTotalDAUAllDims =
+    SELECT
+        @ProcessingDate AS Date,
+        "Total" AS Value,
+        "Total" AS Type,
+        EduTrialPaid,
+        Size,
+        Viral,
+        AVG(DailyCount) AS Last28DayDAU
+    FROM Last28DayTotalDailyAllDims
+;  
+// Calculate Total daily counts with only Edu Dim
+Last28DayTotalDailyEduDim =
+    SELECT
+        Date,
+        "Total" AS Value,
+        "Total" AS Type,
+        EduTrialPaid,
+        "All" AS Size,
+        "All" AS Viral,
+        COUNT(DISTINCT PUID) AS DailyCount
+    FROM Last28Day
+;   
+// Aggregate Total DAU by AVG daily with only Edu Dim
+Last28DayTotalDAUEduDim =
+    SELECT
+        @ProcessingDate AS Date,
+        "Total" AS Value,
+        "Total" AS Type,
+        EduTrialPaid,
+        "All" AS Size,
+        "All" AS Viral,
+        AVG(DailyCount) AS Last28DayDAU
+    FROM Last28DayTotalDailyEduDim
+;   
+// Calculate Total daily counts with only Size Dim
+Last28DayTotalDailySizeDim =
+    SELECT
+        Date,
+        "Total" AS Value,
+        "Total" AS Type,
+        "All" AS EduTrialPaid,
+        Size,
+        "All" AS Viral,
+        COUNT(DISTINCT PUID) AS DailyCount
+    FROM Last28Day
+;   
+// Aggregate Total DAU by AVG daily with only Size Dim
+Last28DayTotalDAUSizeDim =
+    SELECT
+        @ProcessingDate AS Date,
+        "Total" AS Value,
+        "Total" AS Type,
+        "All" AS EduTrialPaid,
+        Size,
+        "All" AS Viral,
+        AVG(DailyCount) AS Last28DayDAU
+    FROM Last28DayTotalDailySizeDim
+;   
+// Calculate Total daily counts with only Viral Dim
+Last28DayTotalDailyViralDim =
+    SELECT
+        Date,
+        "Total" AS Value,
+        "Total" AS Type,
+        "All" AS EduTrialPaid,
+        "All" AS Size,
+        Viral,
+        COUNT(DISTINCT PUID) AS DailyCount
+    FROM Last28Day
+;   
+// Aggregate Total DAU by AVG daily with only Viral Dim
+Last28DayTotalDAUViralDim =
+    SELECT
+        @ProcessingDate AS Date,
+        "Total" AS Value,
+        "Total" AS Type,
+        "All" AS EduTrialPaid,
+        "All" AS Size,
+        Viral,
+        AVG(DailyCount) AS Last28DayDAU
+    FROM Last28DayTotalDailyViralDim
+;  
+// Calculate Total daily counts with NO Dim at all
+Last28DayTotalDailyNoDim =
+    SELECT
+        Date,
+        "Total" AS Value,
+        "Total" AS Type,
+        "All" AS EduTrialPaid,
+        "All" AS Size,
+        "All" AS Viral,
+        COUNT(DISTINCT PUID) AS DailyCount
+    FROM Last28Day
+;   
+// Aggregate Total DAU by AVG daily counts with NO Dim
+Last28DayTotalDAUNoDim =
+    SELECT
+        @ProcessingDate AS Date,
+        "Total" AS Value,
+        "Total" AS Type,
+        "All" AS EduTrialPaid,
+        "All" AS Size,
+        "All" AS Viral,
+        AVG(DailyCount) AS Last28DayDAU
+    FROM Last28DayTotalDailyNoDim
+;  
+
+/****************************************************/
+/* DAU = Union Workload DAU, App DAU, and Total DAU */
+/****************************************************/
+Last28DayDAU = 
+// Workload
+    SELECT 
+        *
+    FROM Last28DayWorkloadDAUAllDims
+    UNION ALL
+    SELECT 
+        *
+    FROM Last28DayWorkloadDAUEduDim
+    UNION ALL
+    SELECT 
+        *
+    FROM Last28DayWorkloadDAUSizeDim
+    UNION ALL
+    SELECT 
+        *
+    FROM Last28DayWorkloadDAUViralDim
+    UNION ALL
+    SELECT 
+        *
+    FROM Last28DayWorkloadDAUNoDim
+    UNION ALL
+// App
+    SELECT 
+        *
+    FROM Last28DayAppDAUAllDims
+    UNION ALL
+    SELECT 
+        *
+    FROM Last28DayAppDAUEduDim
+    UNION ALL
+    SELECT 
+        *
+    FROM Last28DayAppDAUSizeDim
+    UNION ALL
+    SELECT 
+        *
+    FROM Last28DayAppDAUViralDim
+    UNION ALL
+    SELECT 
+        *
+    FROM Last28DayAppDAUNoDim
+    UNION ALL
+// Total
+    SELECT 
+        *
+    FROM Last28DayTotalDAUAllDims
+    UNION ALL
+    SELECT 
+        *
+    FROM Last28DayTotalDAUEduDim
+    UNION ALL
+    SELECT 
+        *
+    FROM Last28DayTotalDAUSizeDim
+    UNION ALL
+    SELECT 
+        *
+    FROM Last28DayTotalDAUViralDim
+    UNION ALL
+    SELECT 
+        *
+    FROM Last28DayTotalDAUNoDim
+;
+
+/**********************************************************************/
+/* Calculate MAU for workload/app/total and union them                */
+/**********************************************************************/
+
+/************/
+/* Workload */
+/************/
+// Calculate Workload MAU with All Dims
+Last28DayWorkloadMAUAllDims =
+    SELECT
+        @ProcessingDate AS Date,
+        Workload AS Value,
+        "Workload" AS Type,
+        EduTrialPaid,
+        Size,
+        Viral,
+        COUNT(DISTINCT PUID) AS Last28DayMAU,
+        COUNT(DISTINCT TenantId) AS Last28DayMAT
+    FROM Last28Day
+;   
+// Calculate Workload MAU with Edu Dim
+Last28DayWorkloadMAUEduDim =
+    SELECT
+        @ProcessingDate AS Date,
+        Workload AS Value,
+        "Workload" AS Type,
+        EduTrialPaid,
+        "All" AS Size,
+        "All" AS Viral,
+        COUNT(DISTINCT PUID) AS Last28DayMAU,
+        COUNT(DISTINCT TenantId) AS Last28DayMAT
+    FROM Last28Day
+;   
+// Calculate Workload MAU with Size Dim
+Last28DayWorkloadMAUSizeDim =
+    SELECT
+        @ProcessingDate AS Date,
+        Workload AS Value,
+        "Workload" AS Type,
+        "All" AS EduTrialPaid,
+        Size,
+        "All" AS Viral,
+        COUNT(DISTINCT PUID) AS Last28DayMAU,
+        COUNT(DISTINCT TenantId) AS Last28DayMAT
+    FROM Last28Day
+;   
+// Calculate Workload MAU with Viral Dim
+Last28DayWorkloadMAUViralDim =
+    SELECT
+        @ProcessingDate AS Date,
+        Workload AS Value,
+        "Workload" AS Type,
+        "All" AS EduTrialPaid,
+        "All" AS Size,
+        Viral,
+        COUNT(DISTINCT PUID) AS Last28DayMAU,
+        COUNT(DISTINCT TenantId) AS Last28DayMAT
+    FROM Last28Day
+;  
+// Calculate Workload MAU with No Dim
+Last28DayWorkloadMAUNoDim =
+    SELECT
+        @ProcessingDate AS Date,
+        Workload AS Value,
+        "Workload" AS Type,
+        "All" AS EduTrialPaid,
+        "All" AS Size,
+        "All" AS Viral,
+        COUNT(DISTINCT PUID) AS Last28DayMAU,
+        COUNT(DISTINCT TenantId) AS Last28DayMAT
+    FROM Last28Day
+;   
+
+/************/
+/* App      */
+/************/
+// Calculate App MAU with All Dims
+Last28DayAppMAUAllDims =
+    SELECT
+        @ProcessingDate AS Date,
+        App AS Value,
+        "App" AS Type,
+        EduTrialPaid,
+        Size,
+        Viral,
+        COUNT(DISTINCT PUID) AS Last28DayMAU,  
+        COUNT(DISTINCT TenantId) AS Last28DayMAT
+    FROM Last28Day
+    WHERE App!="" AND App!=null
+;   
+// Calculate App MAU with Edu Dims
+Last28DayAppMAUEduDim =
+    SELECT
+        @ProcessingDate AS Date,
+        App AS Value,
+        "App" AS Type,
+        EduTrialPaid,
+        "All" AS Size,
+        "All" AS Viral,
+        COUNT(DISTINCT PUID) AS Last28DayMAU,  
+        COUNT(DISTINCT TenantId) AS Last28DayMAT
+    FROM Last28Day
+    WHERE App!="" AND App!=null
+;   
+// Calculate App MAU with Size Dims
+Last28DayAppMAUSizeDim =
+    SELECT
+        @ProcessingDate AS Date,
+        App AS Value,
+        "App" AS Type,
+        "All" AS EduTrialPaid,
+        Size,
+        "All" AS Viral,
+        COUNT(DISTINCT PUID) AS Last28DayMAU, 
+        COUNT(DISTINCT TenantId) AS Last28DayMAT
+    FROM Last28Day
+    WHERE App!="" AND App!=null
+;   
+// Calculate App MAU with Viral Dims
+Last28DayAppMAUViralDim =
+    SELECT
+        @ProcessingDate AS Date,
+        App AS Value,
+        "App" AS Type,
+        "All" AS EduTrialPaid,
+        "All" AS Size,
+        Viral,
+        COUNT(DISTINCT PUID) AS Last28DayMAU, 
+        COUNT(DISTINCT TenantId) AS Last28DayMAT
+    FROM Last28Day
+    WHERE App!="" AND App!=null
+;   
+// Calculate App MAU with No Dim
+Last28DayAppMAUNoDim =
+    SELECT
+        @ProcessingDate AS Date,
+        App AS Value,
+        "App" AS Type,
+        "All" AS EduTrialPaid,
+        "All" AS Size,
+        "All" AS Viral,
+        COUNT(DISTINCT PUID) AS Last28DayMAU,  // using UserId to count user??
+        COUNT(DISTINCT TenantId) AS Last28DayMAT
+    FROM Last28Day
+    WHERE App!="" AND App!=null
+;   
+
+/************/
+/* Total    */
+/************/
+// Calculate Total MAU and MAT with All Dims
+Last28DayTotalMAUAllDims =
+    SELECT
+        @ProcessingDate AS Date,
+        "Total" AS Value,
+        "Total" AS Type,
+        EduTrialPaid,
+        Size,
+        Viral,
+        COUNT(DISTINCT PUID) AS Last28DayMAU,
+        COUNT(DISTINCT TenantId) AS Last28DayMAT
+    FROM Last28Day
+;   
+// Calculate Total MAU and MAT with Edu Dim
+Last28DayTotalMAUEduDim =
+    SELECT
+        @ProcessingDate AS Date,
+        "Total" AS Value,
+        "Total" AS Type,
+        EduTrialPaid,
+        "All" AS Size,
+        "All" AS Viral,
+        COUNT(DISTINCT PUID) AS Last28DayMAU,
+        COUNT(DISTINCT TenantId) AS Last28DayMAT
+    FROM Last28Day
+;   
+// Calculate Total MAU and MAT with Size Dim
+Last28DayTotalMAUSizeDim =
+    SELECT
+        @ProcessingDate AS Date,
+        "Total" AS Value,
+        "Total" AS Type,
+        "All" AS EduTrialPaid,
+        Size,
+        "All" AS Viral,
+        COUNT(DISTINCT PUID) AS Last28DayMAU,
+        COUNT(DISTINCT TenantId) AS Last28DayMAT
+    FROM Last28Day
+;   
+// Calculate Total MAU and MAT with Viral Dim
+Last28DayTotalMAUViralDim =
+    SELECT
+        @ProcessingDate AS Date,
+        "Total" AS Value,
+        "Total" AS Type,
+        "All" AS EduTrialPaid,
+        "All" AS Size,
+        Viral,
+        COUNT(DISTINCT PUID) AS Last28DayMAU,
+        COUNT(DISTINCT TenantId) AS Last28DayMAT
+    FROM Last28Day
+;  
+// Calculate Total MAU and MAT with No Dim
+Last28DayTotalMAUNoDim =
+    SELECT
+        @ProcessingDate AS Date,
+        "Total" AS Value,
+        "Total" AS Type,
+        "All" AS EduTrialPaid,
+        "All" AS Size,
+        "All" AS Viral,
+        COUNT(DISTINCT PUID) AS Last28DayMAU,
+        COUNT(DISTINCT TenantId) AS Last28DayMAT
+    FROM Last28Day
+;   
+
+/*******************************************************/
+/* MAU = Union of Workload MAU, App MAU, and Total MAU */
+/*******************************************************/
+Last28DayMAU =
+// Workload
+    SELECT 
+        *
+    FROM Last28DayWorkloadMAUAllDims
+    UNION ALL    
+    SELECT 
+        *
+    FROM Last28DayWorkloadMAUEduDim
+    UNION ALL    
+    SELECT 
+        *
+    FROM Last28DayWorkloadMAUSizeDim
+    UNION ALL    
+    SELECT 
+        *
+    FROM Last28DayWorkloadMAUViralDim
+    UNION ALL    
+    SELECT 
+        *
+    FROM Last28DayWorkloadMAUNoDim
+    UNION ALL    
+// App
+    SELECT 
+        *
+    FROM Last28DayAppMAUAllDims
+    UNION ALL
+    SELECT 
+        *
+    FROM Last28DayAppMAUEduDim
+    UNION ALL
+    SELECT 
+        *
+    FROM Last28DayAppMAUSizeDim
+    UNION ALL
+    SELECT 
+        *
+    FROM Last28DayAppMAUViralDim
+    UNION ALL
+    SELECT 
+        *
+    FROM Last28DayAppMAUNoDim
+    UNION ALL
+// Total
+    SELECT
+        *
+    FROM Last28DayTotalMAUAllDims
+    UNION ALL
+    SELECT
+        *
+    FROM Last28DayTotalMAUEduDim
+    UNION ALL
+    SELECT
+        *
+    FROM Last28DayTotalMAUSizeDim
+    UNION ALL
+    SELECT
+        *
+    FROM Last28DayTotalMAUViralDim
+    UNION ALL
+    SELECT
+        *
+    FROM Last28DayTotalMAUNoDim
+;
+
+/**********************************************************************/
+/* Join last 28 days DAU, MAU, and processing day count together      */
+/**********************************************************************/
+FinalOutput = 
+    SELECT 
+        dau.Date,
+        dau.Type,
+        dau.Value,
+        dau.EduTrialPaid,
+        dau.Size,
+        dau.Viral,
+        (int)dau.Last28DayDAU AS Last28DayDAU,
+        mau.Last28DayMAU,
+        (double)dau.Last28DayDAU / (double)mau.Last28DayMAU AS Frequency,
+        mau.Last28DayMAT
+    FROM Last28DayDAU AS dau INNER JOIN Last28DayMAU AS mau ON 
+                             dau.Date==mau.Date
+                         AND dau.Value==mau.Value
+                         AND dau.Type==mau.Type
+                         AND dau.EduTrialPaid==mau.EduTrialPaid
+                         AND dau.Size==mau.Size
+                         AND dau.Viral==mau.Viral
+;      
+  
+// Merge with existing L3 V3 file
+#IF (EXISTS(@FinalFilePath))
+    ExistingData = SSTREAM @FinalFilePath;
+    FinalOutput = 
+        SELECT * FROM ExistingData 
+        WHERE DateTime.Parse(Date) != DateTime.Parse(@ProcessingDate)
+        UNION ALL
+        SELECT * FROM FinalOutput;
+#ENDIF
+
+OUTPUT FinalOutput TO SSTREAM @FinalFilePath CLUSTERED BY Date SORTED BY Date DESC;
+
+#CS
+using System.Web;
+
+public static class Helper
+{
+    public static string ClassifyTenantSize(long tenantSize)
+    {
+        string category = "";
+
+        if (tenantSize == 1)
+        {
+            category = "Size 1";
+        }
+        else if (tenantSize <= 4)
+        {
+            category = "1 TO 4";
+        }
+        else if (tenantSize <= 24)
+        {
+            category = "5 TO 24";
+        }
+        else if (tenantSize <= 49)
+        {
+            category = "25 TO 49";
+        }
+        else if (tenantSize <= 249)
+        {
+            category = "50 TO 249";
+        }
+        else if (tenantSize <= 499)
+        {
+            category = "250 TO 499";
+        }
+        else if (tenantSize <= 999)
+        {
+            category = "500 TO 999";
+        }
+        else
+        {
+            category = "1000+";
+        }
+
+        return category;
+    }
+}
+#ENDCS

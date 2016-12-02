@@ -1,0 +1,184 @@
+﻿REFERENCE @"/shares/0365exp.adhoc/O365DataPipeline/Resources/Binaries/Newtonsoft.Json.dll";
+
+#DECLARE ProcessingDate string = DateTime.Parse("@@date@@").AddDays(-3).ToString("yyyy-MM-dd");
+#DECLARE ProcessingYear string = DateTime.Parse("@@date@@").AddDays(-3).ToString("yyyy");
+#DECLARE ProcessingMonth string = DateTime.Parse("@@date@@").AddDays(-3).ToString("MM");
+// Input action L2 data 
+#DECLARE O365DataPipelinePath string = @"/shares/0365exp.adhoc/O365DataPipeline";
+#DECLARE L2DataPath string = string.Format(@"{0}/DAUMAU/L2/Prod/%Y/%m/%Y-%m-%d-User-Actions.ss?date={1}...{2}", @O365DataPipelinePath, @ProcessingDate, @ProcessingDate);
+// Output L3 data
+#DECLARE TenantSnapshotPath string = @"/shares/0365exp.adhoc/O365DataPipeline/UserActionDailyAggregations";
+#DECLARE outputFile string = string.Format(@"{0}/L3/prod/{1}/{2}/User-Actions-{3}.ss", @TenantSnapshotPath, @ProcessingYear, @ProcessingMonth, @ProcessingDate);
+
+Tenants =
+    SELECT Id
+    FROM
+    (
+        VIEW @"/shares/bus.prod/local/office/Odin/Tenant/OfficeDataTenant.view"
+        PARAMS
+        (
+            StartSnapshotTime = @ProcessingDate,
+            EndSnapshotTime = @ProcessingDate
+        )
+    )
+    WHERE CreatedDate >= DateTime.Parse("2016-06-01")
+;
+L2Data = 
+    SELECT 
+        DateTime.Parse(TimeStamp).ToString("yyyy-MM-dd") AS Date,
+        PUID,
+        TenantId,
+        Helper.GetDeviceType(DataSource, DeviceInfo) AS DeviceInfo, 
+        Workload,
+        App,
+        App=="ImpressionEvent"? Click.ToLower():Click AS Click,
+        DataSource
+    FROM (SSTREAM @L2DataPath) LEFT SEMIJOIN Tenants ON TenantId==Tenants.Id
+    WHERE !string.IsNullOrEmpty(TimeStamp)
+      AND !string.IsNullOrEmpty(PUID)
+;
+L2DataShell = 
+    SELECT
+        Date,
+        PUID,
+        TenantId,
+        DeviceInfo,
+        Workload,
+        "Install_" + App AS Action
+    FROM L2Data
+    WHERE DataSource=="Shell"
+      AND Click=="InstallOffice"
+    UNION ALL
+    SELECT
+        Date,
+        PUID,
+        TenantId,
+        DeviceInfo,
+        Workload,
+        "click_" + (Helper.JsonToDict(Click).ContainsKey("pageelementid") ? Helper.JsonToDict(Click)["pageelementid"].ToString().Split('_')[0] : "") AS Action
+    FROM L2Data
+    WHERE DataSource=="Shell"
+      AND App=="ImpressionEvent"
+      AND Helper.JsonToDict(Click)["eventtype"].ToString()=="clickevent"
+      AND !Click.Contains("userdetails") AND !Click.Contains("leftnav")
+    UNION ALL
+    SELECT
+        Date,
+        PUID,
+        TenantId,
+        DeviceInfo,
+        Workload,        // pageelementid_extendedproperties.value()
+        "click_" + (
+        Helper.JsonToDict(Click).ContainsKey("pageelementid") AND 
+        Helper.JsonToDict(Click).ContainsKey("extendedproperties") AND
+        Helper.JsonToDict((Helper.JsonToDict(Click)["extendedproperties"].ToString())).ContainsKey("value") ?
+          Helper.JsonToDict(Click)["pageelementid"].ToString() + "_" + Helper.JsonToDict((Helper.JsonToDict(Click)["extendedproperties"].ToString()))["value"].ToString() : 
+          Helper.JsonToDict(Click).ContainsKey("pageelementid") ? Helper.JsonToDict(Click)["pageelementid"].ToString() : "") AS Action
+    FROM L2Data
+    WHERE DataSource=="Shell"
+      AND App=="ImpressionEvent"
+      AND Helper.JsonToDict(Click)["eventtype"].ToString()=="clickevent"
+      AND (Click.Contains("userdetails") OR Click.Contains("leftnav"))
+    UNION ALL
+    SELECT
+        Date,
+        PUID,
+        TenantId,
+        DeviceInfo,
+        Workload,
+        "page_" + (Helper.JsonToDict(Click).ContainsKey("pageid")? Helper.JsonToDict(Click)["pageid"].ToString():"") AS Action
+    FROM L2Data
+    WHERE DataSource=="Shell"
+      AND App=="ImpressionEvent"
+      AND Helper.JsonToDict(Click)["eventtype"].ToString()=="pageevent"
+;
+// Union processed Shell data with other data sources
+L2Data =
+    SELECT Date,
+           PUID,
+           TenantId,
+           Workload AS App,
+           DeviceInfo,
+           Click AS Action
+    FROM L2Data
+    WHERE DataSource == "OAV" 
+      AND !string.IsNullOrEmpty(Workload)
+    UNION ALL
+    SELECT Date,
+           PUID,
+           TenantId,
+           App,
+           DeviceInfo,
+           Click AS Action
+    FROM L2Data
+    WHERE DataSource == "OAV" 
+      AND !string.IsNullOrEmpty(App)
+    UNION ALL
+    SELECT Date,
+           PUID,
+           TenantId,
+           App,
+           DeviceInfo,
+           "" AS Action
+    FROM L2Data
+    WHERE DataSource == "Client" 
+      AND !string.IsNullOrEmpty(App)
+    UNION ALL
+    SELECT Date,
+           PUID,
+           TenantId,
+           Workload AS App,
+           DeviceInfo,
+           Action
+    FROM L2DataShell
+;
+
+AggregatedData = 
+    SELECT 
+        Date,
+        PUID,
+        TenantId,
+        App,
+        DeviceInfo,
+        Action,
+        COUNT(*) AS Count
+    FROM L2Data
+;
+
+OUTPUT AggregatedData TO SSTREAM @outputFile;
+
+#CS
+using System.Web;
+using Newtonsoft.Json;
+
+public static class Helper
+{
+    public static Dictionary<string, Object> JsonToDict(string jsonString)
+    {
+        return JsonConvert.DeserializeObject<Dictionary<string,Object>>(jsonString);
+    }
+
+    public static string GetDeviceType(string DataSource, string DeviceInfo)
+    {
+        string DeviceType = "";
+
+        switch (DataSource)
+        {
+            case "OAV":
+                DeviceType = DeviceInfo.Split(';')[1].Split('=')[1];
+                break;
+            case "Client":
+                DeviceType = DeviceInfo.Split(';')[0].Split('=')[1];
+                break;
+            case "Shell":
+                DeviceType = DeviceInfo.Split('=')[1];
+                break;
+            default:
+                DeviceType = "unknown";
+                break;
+        }
+
+        return DeviceType;
+    }
+}
+#ENDCS

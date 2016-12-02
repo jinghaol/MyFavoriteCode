@@ -1,0 +1,466 @@
+﻿/* *********************************************************************************************** */
+/* Script GUID:dc3e3238-8151-418b-9781-7a5d8a6aea68                                                */
+/* This script generates daily Office 365 user and tenant engagement data based on Shell rendering */
+/* logs.  It's also called DAUMAU L2 data.  The script is deployed in SDP as a Cosmos activity and */
+/* runs at UTC+12 hours.  The V2 version includes tenant id                                        */
+
+/* reference */
+REFERENCE @"/shares/0365exp.adhoc/AppData/Resources/Binaries/Microsoft.O365Tools.Cosmos.UsageLibrary.dll";
+USING UsageLibrary; 
+
+/* Input */
+#DECLARE ProcessingDate string = DateTime.Parse("@@date@@").AddDays(-3).ToString("yyyy-MM-dd");
+#DECLARE ProcessingYear string = DateTime.Parse("@@date@@").AddDays(-3).ToString("yyyy");
+#DECLARE ProcessingMonth string = DateTime.Parse("@@date@@").AddDays(-3).ToString("MM");
+#DECLARE OfficeActionViewPath string = @"/shares/bus.prod/local/office/Odin/Action/OfficeDataAction.view";
+#DECLARE OfficeSuiteLogsViewPath string = @"/shares/0365exp.adhoc/O365DataPipeline/Resources/Views/Office365SuiteLogs.view";
+#DECLARE OfficeEntitlementViewPath string = @"/shares/bus.prod/local/office/Odin/Entitlement/OfficeDataEntitlement.view";
+#DECLARE O16ClientUsageModulePath string = @"/shares/OSIAdhoc/local/Resources/Modules/SystemHealth.Partners.module";
+#DECLARE OfficeUserViewPath string = @"/shares/bus.prod/local/office/Resources/Views/Public/OBD_User_UserInfo.view";
+#IF(DateTime.Parse(@@date@@) < DateTime.Parse("2015-09-02"))
+    #DECLARE EntitlementDate string = "2015-09-02";
+#ELSE
+    #DECLARE EntitlementDate string = @ProcessingDate;
+#ENDIF
+
+/* Output */
+#DECLARE O365DataPipelinePath string = @"/shares/0365exp.adhoc/O365DataPipeline";
+//#DECLARE O365DataPipelinePath string = @"/users/jinghaol/DAUL2";
+#DECLARE OutputL2Data string = string.Format(@"{0}/DAUMAU/L2/{1}/{2}/{3}/{4}-User-Actions.ss", @O365DataPipelinePath, "Prod", @ProcessingYear, @ProcessingMonth, @ProcessingDate);
+
+/* TagIDs */
+#DECLARE ShellRenderingServerTagID string = "405134";
+#DECLARE ShellRenderingClientTagID string = "175156";
+#DECLARE ShellClickTagID1 string = "175150";
+#DECLARE ShellClickTagID2 string = "401930";
+#DECLARE ShellClickTagIDMe string = "300937";
+#DECLARE ShellLogUrl string = "407712";
+#DECLARE HomePageClicksTagID string = "301233";
+#DECLARE OfficeInstallClickTagID string = "8110";
+#DECLARE ImpressionTagID string = "302978";
+
+/*****************************************************************/
+/* Read SUE logs from the view to include client and server logs */
+/*****************************************************************/
+cookedLogsStream =
+    SELECT *
+    FROM
+    (
+        VIEW @OfficeSuiteLogsViewPath
+        PARAMS
+        (
+            StartDate = @ProcessingDate,
+            EndDate = @ProcessingDate,
+            ServiceName = "All"
+        )
+    )
+;
+// To fill up the possible missing values for UID and PUID fields with same session ones 
+SetOfIds =
+    SELECT 
+        SID, 
+        MAX((NOT string.IsNullOrEmpty(TID) && TID.Length==36)? TID:"") AS TenantId, 
+        MAX((NOT string.IsNullOrEmpty(UID) && UID.Length==36)? UID:"") AS UserId, 
+        MAX((NOT string.IsNullOrEmpty(PUID) && PUID.Length==16)? PUID:"") AS PUID
+    FROM cookedLogsStream 
+;
+cookedLogsStream = 
+    SELECT 
+        TimeStamp, 
+        ids.SID	AS SessionId,
+        ids.TenantId AS TenantId,
+        ids.UserId AS UserId,
+        OS,
+        TagID,
+    	AdHoc0,
+        AdHoc1,
+        Site,
+        ids.PUID AS PUID
+    FROM cookedLogsStream AS log LEFT OUTER JOIN SetOfIds AS ids ON log.SID == ids.SID
+    WHERE TagID IN (@ShellRenderingServerTagID,@ShellRenderingClientTagID,@ShellClickTagID1,@ShellClickTagID2,@ShellClickTagIDMe,@ShellLogUrl,@OfficeInstallClickTagID,@ImpressionTagID)
+      AND DateTime.Parse(TimeStamp).CompareTo(DateTime.Parse(@ProcessingDate)) >= 0
+      AND DateTime.Parse(TimeStamp).CompareTo(DateTime.Parse(@ProcessingDate).AddDays(1)) <= 0
+;
+// Base on the TagID, project right information into right column
+ShellData =
+    SELECT 
+        TimeStamp,
+        SessionId,
+        UserId,
+        OS,
+        TenantId,
+        PUID,
+        string.IsNullOrEmpty(AdHoc0)? (string.IsNullOrEmpty(Site)? "":Helper.FormalizeWorkLoadID(Site.ToLower())):
+                                      Helper.FormalizeWorkLoadID(AdHoc0.ToLower()) AS Workload,
+        "" AS Click,
+        "" AS App
+    FROM cookedLogsStream
+    WHERE TagID == @ShellRenderingServerTagID //405134
+    UNION ALL
+    SELECT 
+        TimeStamp,
+        SessionId,
+        UserId,
+        OS,
+        TenantId,
+        PUID,
+        string.IsNullOrEmpty(Site)? "":Helper.FormalizeWorkLoadID(Site.ToLower()) AS Workload,
+        "" AS Click,
+        "" AS App
+    FROM cookedLogsStream
+    WHERE TagID == @ShellRenderingClientTagID //175156
+    UNION ALL
+    SELECT 
+        TimeStamp,
+        SessionId,
+        UserId,
+        OS,
+        TenantId,
+        PUID,
+        string.IsNullOrEmpty(Site)? "":Helper.FormalizeWorkLoadID(Site.ToLower()) AS Workload,
+        AdHoc0 AS Click,
+        "" AS App
+    FROM cookedLogsStream
+    WHERE TagID == @ShellClickTagID1 //175150
+    UNION ALL
+    SELECT 
+        TimeStamp,
+        SessionId,
+        UserId,
+        OS,
+        TenantId,
+        PUID,
+        string.IsNullOrEmpty(Site)? "":Helper.FormalizeWorkLoadID(Site.ToLower()) AS Workload,
+        AdHoc0 AS Click,
+        "" AS App
+    FROM cookedLogsStream
+    WHERE TagID == @ShellClickTagID2 //401930
+    UNION ALL
+    SELECT 
+        TimeStamp,
+        SessionId,
+        UserId,
+        OS,
+        TenantId,
+        PUID,
+        string.IsNullOrEmpty(Site)? "":Helper.FormalizeWorkLoadID(Site.ToLower()) AS Workload,
+        "Me" AS Click,
+        "" AS App
+    FROM cookedLogsStream
+    WHERE TagID == @ShellClickTagIDMe //300937
+    UNION ALL
+    SELECT 
+        TimeStamp,
+        SessionId,
+        UserId,
+        OS,
+        TenantId,
+        PUID,
+        string.IsNullOrEmpty(Site)? "":Helper.FormalizeWorkLoadID(Site.ToLower()) AS Workload,
+        "" AS Click,
+        AdHoc0 AS App
+    FROM cookedLogsStream
+    WHERE TagID == @ShellLogUrl //407712
+    UNION ALL
+    SELECT 
+        TimeStamp,
+        SessionId,
+        UserId,
+        OS,
+        TenantId,
+        PUID,
+        string.IsNullOrEmpty(Site)? "":Helper.FormalizeWorkLoadID(Site.ToLower()) AS Workload,
+        AdHoc0 AS Click,
+        "Home" AS App
+    FROM cookedLogsStream
+    WHERE TagID == @HomePageClicksTagID //301233
+    UNION ALL
+    SELECT 
+        TimeStamp,
+        SessionId,
+        UserId,
+        OS,
+        TenantId,
+        PUID,
+        "Portal" AS Workload,
+        "InstallOffice" AS Click,
+        AdHoc1 AS App
+    FROM cookedLogsStream
+    WHERE TagID == @OfficeInstallClickTagID //8110
+    UNION ALL
+    SELECT 
+        TimeStamp,
+        SessionId,
+        UserId,
+        OS,
+        TenantId,
+        PUID,
+        "Portal" AS Workload,
+        AdHoc1 AS Click,
+        "ImpressionEvent" AS App
+    FROM cookedLogsStream
+    WHERE TagID == @ImpressionTagID //302978
+;
+
+/*****************************************************************/
+/* Read Office Action from Office Action View                    */
+/*****************************************************************/
+OfficeActions =
+    SELECT 
+        Time AS TimeStamp,
+        SessionId,
+        UserIdSpace, 
+        UserId AS PUID,
+        UserInfo.Ids.UserObjectId AS UserId,
+        UserInfo.OMSTenantId AS TenantId,
+        RawName,
+        ClientAppInfo.Platform AS ClientPlatform,
+        ClientAppInfo.Name AS AppName,
+        ServiceInfo.ShortName AS ServiceName,
+        ClientDeviceInfo.Type.ToString() AS DeviceType,
+        ClientDeviceInfo.Model AS DeviceModel,
+        ClientOSInfo.Name AS DeviceOS
+    FROM
+    (
+        VIEW @OfficeActionViewPath
+        PARAMS
+        (
+            ServiceName = "SPO,EXO,LYO,Yammer,OneDrive,Client",
+            StartTime = @ProcessingDate,
+            EndTime = @ProcessingDate,
+            RetrieveLatestOfficeClientData = true,
+            Office365Instance = "Worldwide"
+        )
+    )
+    WHERE UserIdSpace=="OrgIdPUID"
+      AND IsUserTriggered
+      AND NOT string.IsNullOrEmpty(UserId)
+      AND NOT UserId.ToLower().Contains("dummy")
+      AND UserInfo.UserType == "RegularUser"
+      AND Office365Category == "Commercial"
+      AND IsIntentional
+      AND NOT UserInfo.IsDummy AND NOT UserInfo.IsGuestUser 
+;
+
+/*****************************************************************/
+/* Read Office Rich Client Usage from Entitlement and O16 view   */
+/*****************************************************************/
+// Read License, Tenant, User data
+Licenses =
+    VIEW @OfficeEntitlementViewPath
+    PARAMS
+    (
+        StartSnapshotTime = @EntitlementDate,
+        EndSnapshotTime = @EntitlementDate,
+        ExcludeConflictResources = true,
+        Office365Category = "Commercial"
+    )
+;
+LicenseTenantUser =
+    SELECT DISTINCT
+        OMSTenantId AS TenantId,
+        UserId,
+        OlsLicense.Id AS OlsLicenseId
+    FROM Licenses CROSS APPLY OlsLicenses AS OlsLicense
+    WHERE NOT string.IsNullOrEmpty(OlsLicense.Id)
+      AND UserIdSpace=="OrgIdPUID"
+      AND NOT string.IsNullOrEmpty(UserId)
+;
+// Read client session data 
+MODULE @"/shares/OSIAdhoc/local/Resources/Modules/SystemHealth.Partners.module";
+ClientUsage =
+    SELECT 
+        OlsLicenseId.Length>=16? OlsLicenseId.Substring(0,16):"N/A" AS TrimmedOlsLicenseId, // trim the last 4 chars from the LicenseId
+        *
+    FROM SystemHealthPartners.ViewClientProcessSessions // old one is ViewClientUsage
+    (
+        //IsProduction = true,
+        StartDate = DateTime.Parse(@ProcessingDate),
+        EndDate = DateTime.Parse(@ProcessingDate)
+    )
+    WHERE AudienceGroup IN ("Insiders", "Production")
+      AND !string.IsNullOrEmpty(OlsLicenseId)
+;
+ClientUsage =
+    SELECT 
+        SessionStart.ToString() AS TimeStamp,
+        ProcessSessionId,
+        l.UserId AS PUID,
+        DeviceId,
+        TrimmedOlsLicenseId,
+        OlsLicenseId,
+        l.TenantId,
+        SessionStart,
+        MsoAppName,
+        UserAgent,
+        DeviceClass AS DeviceType,
+        DeviceModel, 
+        OsEnvironmentName AS DeviceOS
+    FROM ClientUsage AS c INNER JOIN LicenseTenantUser AS l ON c.TrimmedOlsLicenseId==l.OlsLicenseId
+    WHERE NOT string.IsNullOrEmpty(l.UserId)
+;
+
+/*****************************************************************/
+/* Union all 3 data sources together                             */
+/*****************************************************************/
+data = 
+    SELECT 
+        TimeStamp,
+        SessionId,
+        TenantId,
+        PUID,
+        "" AS DeviceId,
+        "OS="+OS AS DeviceInfo,
+        Workload,
+        Click,
+        App,
+        "Shell" AS DataSource
+    FROM ShellData
+    UNION ALL
+    SELECT 
+        TimeStamp.ToString() AS TimeStamp,
+        SessionId,
+        TenantId,
+        PUID,
+        "" AS DeviceId,
+        "OS="+DeviceOS+";"+"Type="+DeviceType+";"+"Model="+DeviceModel AS DeviceInfo,
+        ClientPlatform=="Web"? "WAC":Helper.FormalizeWorkLoadID(ServiceName.ToLower()) AS Workload,
+        RawName AS Click,
+        (AppName.ToLower().Contains("word") OR 
+         AppName.ToLower().Contains("excel") OR
+         AppName.ToLower().Contains("powerpoint") OR 
+         AppName.ToLower().Contains("project") OR 
+         AppName.ToLower().Contains("visio") OR 
+         AppName.ToLower().Contains("access") OR 
+         AppName.ToLower().Contains("publisher") OR 
+         AppName.ToLower().Contains("outlook") OR 
+         AppName.ToLower().Contains("onenote"))? (string.IsNullOrEmpty(ClientPlatform)? "":ClientPlatform+":") + AppName:"" AS App,
+        "OAV" AS DataSource
+    FROM OfficeActions 
+    UNION ALL
+    SELECT 
+        TimeStamp,
+        ProcessSessionId AS SessionId,
+        TenantId,
+        PUID,
+        DeviceId,
+        "OS="+DeviceOS+";"+"Type="+DeviceType+";"+"Model="+DeviceModel AS DeviceInfo,
+        "" AS Workload,
+        "" AS Click,
+        MsoAppName AS App,
+        "Client" AS DataSource
+    FROM ClientUsage        
+;
+UserInfo = 
+    SELECT 
+        UserObjectId,
+        OrgIdPUIDHex,
+        OMSTenantId,
+        HasEDU,
+        HasPaid
+    FROM
+    (
+        VIEW @OfficeUserViewPath
+        PARAMS
+        (
+            startDate=DateTime.Parse(@ProcessingDate), 
+            endDate=DateTime.Parse(@ProcessingDate), 
+            excludeReferenceDlls="DataMining.Office.ScopeExtension.dll"
+        )
+    )
+    WHERE NOT string.IsNullOrEmpty(OrgIdPUIDHex)
+;
+// Join tenant and user info with data
+data = 
+    SELECT 
+        TimeStamp,
+        SessionId,
+        string.IsNullOrEmpty(TenantId)? u.OMSTenantId:TenantId AS TenantId,
+        PUID,
+        DeviceId,
+        DeviceInfo,
+        Workload,
+        Click,
+        App,
+        DataSource
+    FROM data LEFT OUTER JOIN UserInfo AS u ON data.PUID==u.OrgIdPUIDHex
+;
+
+OUTPUT data TO SSTREAM @OutputL2Data;
+
+#CS
+public static class Helper
+{
+    /// <summary>
+    /// This method parse out workload id and name it
+    /// </summary>
+    /// <param name="value"></param>
+    public static string FormalizeWorkLoadID(string adHocValue)
+    {
+        switch (adHocValue)
+        {
+            case "exchange":
+            case "exo":
+                return "Exchange";
+            case "sharepoint":
+            case "spo":
+                return "SharePoint";
+            case "fim":
+                return "Others";
+            case "lync":
+            case "lyo":
+                return "Lync";
+            case "officedotcom":
+                return "Office.com";
+            case "crm":
+                return "CRM";
+            case "forefront":
+                return "ForeFront";
+            case "onramp":
+                return "OnRamp";
+            case "aadux":
+                return "AADUX";
+            case "adminportal":
+                return "Portal";
+            case "apps":
+                return "Apps";
+            case "yammer":
+                return "Yammer";
+            case "project":
+                return "Project";
+            case "pulse":
+                return "Delve";
+            case "powerbi":
+                return "Power BI";
+            case "exchangeadmin":
+                return "ExchangeAdmin";
+            case "exchangeiwoptions":
+                return "ExchangeIWOptions";
+            case "compliancecenter":
+                return "ComplianeCenter";
+            case "wac":
+                return "WAC";
+            case "iwapp":
+                return "IWApp";
+            case "sway":
+                return "Sway";
+            case "sissync":
+                return "Sissync";
+            case "onenoteservice":
+                return "OneNoteService";
+            case "powerbidashboard":
+                return "Power BI";
+            case "onedrive":
+                return "OneDrive";
+            case "protectioncenter":
+                return "ProtectionCenter";
+            case "powerapps":
+                return "PowerApps";
+            case "collabdb":
+                return "CollabDB";
+            default:
+                return adHocValue;
+        }
+    }
+}
+#ENDCS

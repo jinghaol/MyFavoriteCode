@@ -1,0 +1,200 @@
+﻿CREATE VIEW TenantAction
+SCHEMA 
+(
+    TenantId:string,
+    TenantCreatedDate:string,
+    TenantCountryCode:string,
+    Day1PaidSub:long,
+    Day1TrialSub:long,
+    InitialOfferName:string,
+    TrialToPaidConvertedDate:string,
+    LicensedUsersOnTrialToPaidDay:int?,
+    PaidOfferName:string,
+    FirstClientActivatedDate:DateTime?,
+    NumberOfClientActivatedLicenses:long?,
+    ProPlusEnabledUsers:int?,
+    DomainCount:long?,
+    HasCustomDomain:bool,
+    NumberOfPCInstalls:long?, 
+    NumberOfMacInstalls:long?, 
+    NumberOfAndroidPhoneInstalls:long?,  
+    NumberOfAndroidTabletInstalls:long?, 
+    NumberOfiPhoneInstalls:long?, 
+    NumberOfiPadInstalls:long?, 
+    NumberOfWindowsPhoneInstalls:long?, 
+    NumberOfWindowsTabletInstalls:long? 
+)
+PARAMS 
+(
+    TenantAfterDate string, 
+    TenantBeforeDate string,
+    ConvertedNumberDays int
+)
+AS BEGIN
+
+#DECLARE LastConvertedDate string = DateTime.Parse(@TenantBeforeDate).AddDays(@ConvertedNumberDays).ToString("yyyy-MM-dd");
+#DECLARE TenantPath string = string.Format("/shares/0365exp.adhoc/O365DataPipeline/TenantSnapshots/L2/prod/%Y/%m/TenantSnapshot-%Y-%m-%d.ss?date={0}...{1}", @TenantAfterDate, @LastConvertedDate);
+
+// Only query tenants created within the period
+Tenants = 
+    SELECT *
+    FROM (SSTREAM @TenantPath)
+    WHERE DateTime.Parse(CreatedDate) >= DateTime.Parse(@TenantAfterDate)
+      AND DateTime.Parse(CreatedDate) < DateTime.Parse(@TenantBeforeDate).AddDays(1)
+;
+
+// 0) Get the conversion date of all trial-to-paid tenants 
+TrialToPaidTenants =
+    SELECT
+        t1.TenantId,
+        t1.CreatedDate,
+        t1.SnapshotDate,
+        t1.Licensed,
+        t1.PaidCount,
+        t1.TrialCount,
+        t2.TenantId AS TID2,
+        t2.CreatedDate AS CreatedDate2,
+        t2.SnapshotDate AS SnapshotDate2,
+        t2.SnapshotDate==null? 9999:(DateTime.Parse(t2.SnapshotDate) - DateTime.Parse(t2.CreatedDate)).TotalDays AS ConvertedNumberDays, 
+        t2.Licensed AS Licensed2,
+        t2.PaidCount AS PaidCount2,
+        t2.TrialCount AS TrialCount2
+    FROM Tenants AS t1 INNER JOIN Tenants AS t2 ON t1.TenantId==t2.TenantId
+    WHERE t1.PaidCount==0 AND t2.PaidCount>0
+      AND DateTime.Parse(t1.SnapshotDate).AddDays(1)==DateTime.Parse(t2.SnapshotDate)
+;
+// 1) Gets the information of tenant on its day 1, and trial to paid converted date generated above
+TrialToPaidTenants = 
+    SELECT 
+        t.TenantId,
+        t.CreatedDate AS TenantCreatedDate,
+        t.PaidCount AS Day1PaidSub,
+        t.TrialCount AS Day1TrialSub,
+        (ttp.SnapshotDate2==null AND t.PaidCount>0)?  t.CreatedDate:(ConvertedNumberDays<=@ConvertedNumberDays? ttp.SnapshotDate2:null) AS TrialToPaidConvertedDate,
+        (ttp.Licensed2==null AND t.PaidCount>0)? t.Licensed:ttp.Licensed2 AS LicensedUsersOnTrialToPaidDay
+    FROM Tenants AS t LEFT OUTER JOIN TrialToPaidTenants AS ttp ON t.TenantId==ttp.TenantId
+    WHERE t.CreatedDate==t.SnapshotDate
+;
+// 2) Join the information of tenant on the last converted day
+Tenants =
+    SELECT
+        tpt.*,
+        t.SnapshotDate,
+        t.InstalledPC, 
+        t.InstalledMac, 
+        t.InstalledAndroidPhone, 
+        t.InstalledAndroidTablet, 
+        t.InstallediPhone, 
+        t.InstallediPad, 
+        t.InstalledWindowsPhone, 
+        t.InstalledWindowsTablet 
+    FROM TrialToPaidTenants AS tpt INNER JOIN Tenants AS t ON tpt.TenantId==t.TenantId 
+    WHERE DateTime.Parse(tpt.TenantCreatedDate).AddDays(@ConvertedNumberDays)==DateTime.Parse(t.SnapshotDate)
+;
+// 3) Get domain information 
+TenantDomain =
+    SELECT Id AS TenantId,
+           string.Join("", ARRAY_AGG(Domain.Name + ";").Distinct().ToArray()) AS DomainNames,
+           COUNT(*) AS DomainCount
+    FROM
+    (
+        VIEW @"/shares/bus.prod/local/office/Odin/Tenant/OfficeDataTenant.view"
+        PARAMS
+        (
+            StartSnapshotTime = @LastConvertedDate,
+            EndSnapshotTime = @LastConvertedDate
+        )
+    ) AS t LEFT SEMIJOIN Tenants ON t.Id == Tenants.TenantId CROSS APPLY t.Domains AS Domain 
+;
+// 4) Get ProPlus activated information 
+TenantLicense =
+    SELECT
+        OMSTenantId AS TenantId,
+        MIN(CreatedDate) AS FirstOfficeActDate,
+        COUNT(*) AS ActCount
+    FROM 
+    ( 
+        VIEW @"/shares/bus.prod/local/office/Odin/Entitlement/OfficeDataEntitlement.view"
+        PARAMS
+        (
+            StartSnapshotTime = @LastConvertedDate,
+            EndSnapshotTime = @LastConvertedDate,
+            ExcludeConflictResources = true,
+            Office365Category = "Commercial"
+        )
+    ) AS tl LEFT SEMIJOIN Tenants ON tl.OMSTenantId == Tenants.TenantId
+;
+// 5) Gets CountryCode, ProPlusEnabledUsers, Channel, and Offer of first Subscription, and paid offer
+TenantSub = 
+    SELECT
+        Id AS TenantId,
+        SignupLocationInfo.CountryCode,
+        UserStatisticsInfo.ProPlusEnabledUsers,
+        UserStatisticsInfo.LicensedUsers,
+        ActivatedSubscriptionStatisticsInfo.PaidCount AS FinalPaidSub,
+        Sub.ChannelType.ToString() AS ChannelType,
+        Sub.SKU.DisplayName.Replace(',', '#') AS OfferName,
+        Sub.Offer.Id AS OfferId,
+        CreateDateOfFirstSubscription==Sub.LifeCycleDates.CreatedDate? true:false AS IsFirstSub,
+        Sub.IsTrialToPaidConversion,
+        Sub.LifeCycleDates.TrialToPaidConversionDate,    
+        Sub.HasPaidSeats,
+        Sub.Offer.IsTrial,
+        Sub.State.ToString() AS SubState,
+        Sub.DeactivationReasonCode
+    FROM 
+    (
+        VIEW @"/shares/bus.prod/local/office/Odin/Tenant/OfficeDataTenant.view"
+        PARAMS
+        (
+            ExcludeConflictResources = true,
+            StartSnapshotTime = @LastConvertedDate,
+            EndSnapshotTime = @LastConvertedDate
+        )
+    ) AS ts LEFT SEMIJOIN Tenants ON ts.Id == Tenants.TenantId CROSS APPLY ts.Subscriptions AS Sub          
+    WHERE Sub.DeactivationReasonCode != 4
+;
+TenantSub =
+    SELECT
+        TenantId,
+        ANY_VALUE(CountryCode) AS TenantCountryCode,
+        ANY_VALUE(ProPlusEnabledUsers) AS ProPlusEnabledUsers,
+        ANY_VALUE(LicensedUsers) AS LicensedUsers,
+        ANY_VALUE(FinalPaidSub) AS FinalPaidSub,
+        MAX(IsFirstSub==true ? ChannelType:"") AS InitialChannelType,
+        MAX(IsFirstSub==true ? OfferName:"") AS InitialOfferName,
+        MAX(IsFirstSub==true ? OfferId:"") AS InitialOfferId,
+        string.Join("", ARRAY_AGG(!IsTrial? OfferName+";":null).ToArray()) AS SubscriptionDestination        
+    FROM TenantSub
+;
+// 6) Join them all together
+TenantFullInfo =
+    SELECT
+        t.TenantId,
+        t.TenantCreatedDate,
+        ts.TenantCountryCode,
+        t.Day1PaidSub,
+        t.Day1TrialSub,
+        ts.InitialOfferName,
+        t.TrialToPaidConvertedDate,
+        t.TrialToPaidConvertedDate!=null? t.LicensedUsersOnTrialToPaidDay:null AS LicensedUsersOnTrialToPaidDay,
+        t.TrialToPaidConvertedDate!=null? ts.SubscriptionDestination:"" AS PaidOfferName,
+        tl.FirstOfficeActDate AS FirstClientActivatedDate,
+        tl.ActCount AS NumberOfClientActivatedLicenses,
+        ts.ProPlusEnabledUsers,
+        td.DomainCount,
+        td.DomainCount>1? true:false AS HasCustomDomain,
+
+        t.InstalledPC AS NumberOfPCInstalls, 
+        t.InstalledMac AS NumberOfMacInstalls, 
+        t.InstalledAndroidPhone AS NumberOfAndroidPhoneInstalls,  
+        t.InstalledAndroidTablet AS NumberOfAndroidTabletInstalls, 
+        t.InstallediPhone AS NumberOfiPhoneInstalls, 
+        t.InstallediPad AS NumberOfiPadInstalls, 
+        t.InstalledWindowsPhone AS NumberOfWindowsPhoneInstalls, 
+        t.InstalledWindowsTablet  AS NumberOfWindowsTabletInstalls 
+    FROM Tenants AS t LEFT OUTER JOIN TenantDomain AS td ON t.TenantId==td.TenantId
+                      LEFT OUTER JOIN TenantLicense AS tl ON t.TenantId==tl.TenantId  
+                      LEFT OUTER JOIN TenantSub AS ts ON t.TenantId==ts.TenantId  
+;
+END;

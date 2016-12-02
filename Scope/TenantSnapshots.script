@@ -1,0 +1,110 @@
+﻿////Script GUID:396c2558-b002-405c-b2ef-4fe2c0a676f2
+////Used for tracking history
+#DECLARE TenantSnapshotPath string = @"/shares/0365exp.adhoc/O365DataPipeline/TenantSnapshots/L2";
+//#DECLARE TenantSnapshotPath string = @"/users/jinghaol/BPT/TenantSnapshots/L2";
+#DECLARE ProcessingDate string = DateTime.Parse(@@date@@).AddDays(-2).ToString("yyyy-MM-dd");
+#DECLARE ProcessingYear string = DateTime.Parse(@@date@@).AddDays(-2).ToString("yyyy");
+#DECLARE ProcessingMonth string = DateTime.Parse(@@date@@).AddDays(-2).ToString("MM");
+#DECLARE Environment string = @@Environment@@;
+#DECLARE env string = IF(@Environment.Equals("prod", StringComparison.OrdinalIgnoreCase), "Worldwide", "Dogfood");
+#DECLARE outputFilePath string = string.Format("{0}/{4}/{1}/{2}/TenantSnapshot-{3}.ss", @TenantSnapshotPath, @ProcessingYear, @ProcessingMonth, @ProcessingDate, @Environment);
+
+/************************************************************/
+/*  Use ODIN tenant view to create set of smaller tenant    */
+/*  daily snapshots only including LicensedUsers, PaidCount */
+/*  , TrialCount, and installed devices info                */
+/************************************************************/
+Tenants =
+    VIEW @"/shares/bus.prod/local/office/Odin/Tenant/OfficeDataTenant.view"
+    PARAMS
+    (
+        StartSnapshotTime = @ProcessingDate,
+        EndSnapshotTime = @ProcessingDate,
+        Office365Instance = @env
+    );
+Tenants =
+    SELECT
+        @ProcessingDate AS SnapshotDate,
+        Id AS TenantId,
+        CreatedDate.ToString("yyyy-MM-dd") AS CreatedDate,
+        UserStatisticsInfo.LicensedUsers AS Licensed,
+        UserStatisticsInfo.EXOEnabledUsers AS EXO,
+        UserStatisticsInfo.SPOEnabledUsers AS SPO,
+        UserStatisticsInfo.OD4BEnabledUsers AS OD4B,
+        UserStatisticsInfo.ProPlusEnabledUsers AS ProPlus,
+        UserStatisticsInfo.TotalUsers AS Total,
+        ActivatedSubscriptionStatisticsInfo.PaidCount,
+        ActivatedSubscriptionStatisticsInfo.TrialCount,
+        Sub.HasPaidSeats,
+        Sub.PaymentMethod,
+        Sub.State.ToString() AS SubState
+    FROM Tenants CROSS APPLY Subscriptions AS Sub
+    WHERE CreatedDate >= DateTime.Parse("2016-06-01")  // only gets tenants created after 7/1/16
+      AND !IsTest
+;
+Tenants =
+    SELECT
+        ANY_VALUE(SnapshotDate) AS SnapshotDate,
+        TenantId,
+        ANY_VALUE(CreatedDate) AS CreatedDate,
+        ANY_VALUE(Licensed) AS Licensed,
+        ANY_VALUE(EXO) AS EXO,
+        ANY_VALUE(SPO) AS SPO,
+        ANY_VALUE(OD4B) AS OD4B,
+        ANY_VALUE(ProPlus) AS ProPlus,
+        ANY_VALUE(Total) AS Total,
+        ANY_VALUE(PaidCount) AS PaidCount,
+        ANY_VALUE(TrialCount) AS TrialCount,
+        COUNT((HasPaidSeats AND SubState=="Active")? PaymentMethod:null) AS RealPaidCount
+    FROM Tenants
+;
+TenantLicense =
+    SELECT
+        OMSTenantId AS TenantId,
+        Ols.Id,
+        Ols.IsLicenseActive,
+        Ols.OlsMachineInfo.Id AS MachineId,
+        Ols.OlsMachineInfo.MachineStatus.ToString() AS MachineStatus,
+        Ols.OlsMachineInfo.MachineOs,
+        Ols.OlsMachineInfo.MachineSubType,
+        Ols.OlsMachineInfo.MachineType       
+    FROM 
+    ( 
+        VIEW @"/shares/bus.prod/local/office/Odin/Entitlement/OfficeDataEntitlement.view"
+        PARAMS
+        (
+            StartSnapshotTime = @ProcessingDate,
+            EndSnapshotTime = @ProcessingDate,
+            ExcludeConflictResources = true,
+            Office365Category = "Commercial"
+        )
+    ) LEFT SEMIJOIN Tenants ON OMSTenantId==Tenants.TenantId CROSS APPLY OlsLicenses AS Ols 
+;
+TenantLicense =
+    SELECT TenantId,
+           COUNT(DISTINCT MachineType=="Pc"? MachineId:null) AS InstalledPC,
+           COUNT(DISTINCT MachineType=="Mac"? MachineId:null) AS InstalledMac,
+           COUNT(DISTINCT MachineType=="Mobile" && MachineSubType=="Android Phone"? MachineId:null) AS InstalledAndroidPhone,
+           COUNT(DISTINCT MachineType=="Mobile" && MachineSubType=="Android Tablet"? MachineId:null) AS InstalledAndroidTablet,
+           COUNT(DISTINCT MachineType=="Mobile" && MachineSubType=="iPhone"? MachineId:null) AS InstallediPhone,
+           COUNT(DISTINCT MachineType=="Mobile" && MachineSubType=="iPad"? MachineId:null) AS InstallediPad,
+           COUNT(DISTINCT MachineType=="Mobile" && MachineSubType=="Windows Phone"? MachineId:null) AS InstalledWindowsPhone,
+           COUNT(DISTINCT MachineType=="Mobile" && MachineSubType=="Windows Tablet"? MachineId:null) AS InstalledWindowsTablet
+    FROM TenantLicense
+    WHERE IsLicenseActive
+      AND MachineStatus=="Provisioned"
+;
+data = 
+    SELECT t.*,
+           InstalledPC!=null? InstalledPC:0 AS InstalledPC,
+           InstalledMac!=null? InstalledMac:0 AS InstalledMac,
+           InstalledAndroidPhone!=null? InstalledAndroidPhone:0 AS InstalledAndroidPhone,
+           InstalledAndroidTablet!=null? InstalledAndroidTablet:0 AS InstalledAndroidTablet,
+           InstallediPhone!=null? InstallediPhone:0 AS InstallediPhone,
+           InstallediPad!=null? InstallediPad:0 AS InstallediPad,
+           InstalledWindowsPhone!=null? InstalledWindowsPhone:0 AS InstalledWindowsPhone,
+           InstalledWindowsTablet!=null? InstalledWindowsTablet:0 AS InstalledWindowsTablet 
+    FROM Tenants AS t LEFT OUTER JOIN TenantLicense AS tl ON t.TenantId==tl.TenantId
+;   
+
+OUTPUT data TO SSTREAM @outputFilePath;

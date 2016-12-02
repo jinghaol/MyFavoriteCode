@@ -1,0 +1,52 @@
+﻿CREATE VIEW TenantAction
+SCHEMA 
+(
+    TenantId:string,
+    CreatedDate:string,
+    ActionStartDate:DateTime,
+    ActionEndDate:DateTime,
+    App:string,
+    DeviceInfo:string,
+    UserAction:string,
+    ActionCount:long,
+    UserCount:long,
+    UsageDays:long,
+    FirstUseDate:DateTime
+)
+PARAMS 
+(
+    TenantAfterDate string, 
+    TenantBeforeDate string,
+    StartDay int,
+    EndDay int
+)
+AS BEGIN
+
+#DECLARE ActionDataPath string = string.Format("/shares/0365exp.adhoc/O365DataPipeline/UserActionDailyAggregations/L3/prod/%Y/%m/User-Actions-%Y-%m-%d.ss?date={0}...{1}", 
+    @TenantAfterDate, DateTime.Parse(@TenantBeforeDate).AddDays(@EndDay).ToString("yyyy-MM-dd"));
+#DECLARE TenantDataPath string = string.Format("/shares/0365exp.adhoc/O365DataPipeline/TenantSnapshots/L2/prod/%Y/%m/TenantSnapshot-%Y-%m-%d.ss?date={0}...{1}", 
+    @TenantAfterDate, @TenantBeforeDate);
+// Only query tenants created within the period
+Tenants = 
+    SELECT TenantId, CreatedDate
+    FROM (SSTREAM @TenantDataPath)
+    WHERE DateTime.Parse(CreatedDate) >= DateTime.Parse(@TenantAfterDate)
+      AND DateTime.Parse(CreatedDate) < DateTime.Parse(@TenantBeforeDate).AddDays(1)
+;
+data =
+    SELECT t.*,
+           DateTime.Parse(t.CreatedDate).AddDays(@StartDay-1) AS ActionStartDate,
+           DateTime.Parse(t.CreatedDate).AddDays(@EndDay) AS ActionEndDate,
+           a.App,
+           a.DeviceInfo,
+           a.Action AS UserAction,
+           SUM(a.Count!=null? a.Count:0) AS ActionCount,
+           COUNT(DISTINCT a.PUID) AS UserCount,
+           COUNT(DISTINCT a.Date) AS UsageDays,
+           MIN(DateTime.Parse(a.Date!=null? a.Date:"1900-01-01")) AS FirstUseDate
+    FROM Tenants AS t LEFT OUTER JOIN (SSTREAM @ActionDataPath) AS a ON t.TenantId==a.TenantId
+    WHERE a.Date==null
+       OR (DateTime.Parse(a.Date) >= DateTime.Parse(t.CreatedDate).AddDays(@StartDay-1)
+           AND DateTime.Parse(a.Date) < DateTime.Parse(t.CreatedDate).AddDays(@EndDay))
+;
+END;
